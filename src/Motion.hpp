@@ -1,5 +1,7 @@
 #pragma once
 
+#include "SpeedGain.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -93,41 +95,55 @@ class Motion {
         velocity = 0;
         m_speed = 0;
     }
+    void rebase(double delta) {
+        const double shifted = position + delta, target = m_target + delta;
+        if (std::isfinite(delta) && std::isfinite(shifted) && std::isfinite(target)) {
+            position = shifted;
+            m_target = target;
+        }
+    }
     void drag(double rawDelta, double dt) {
         if (phase != Phase::Dragging || !std::isfinite(rawDelta) || !std::isfinite(dt) || dt < 0)
             return;
         // Direct position updates never go through a smoothing filter. Only
         // speed estimation is filtered, so slow tracking has no added latency.
-        const bool timed = dt > 0 && dt <= 0.2;
-        const double speed = timed ? std::abs(rawDelta) / dt : 0;
-        const double alpha = timed ? -std::expm1(-dt / tuning.velocityTime) : 1;
-        m_speed += alpha * (speed - m_speed);
-        const double q = std::clamp(m_speed / tuning.accelerationSpeed, 0.0, 1.0);
-        const double gain = tuning.sensitivity * (1 + tuning.acceleration * q * q * (3 - 2 * q));
+        const double speed = dt > 0 ? std::abs(rawDelta) / dt : 0;
+        const bool timed = dt > 0 && std::isfinite(speed);
+        const double alpha = timed ? -std::expm1(-dt / tuning.velocityTime) : 0;
+        const double shape = timed ? detail::averageGainShape(dt, tuning.velocityTime, m_speed, speed, tuning.accelerationSpeed) :
+                                     detail::gainShape(m_speed / tuning.accelerationSpeed);
+        const double gain = tuning.sensitivity * (1 + tuning.acceleration * shape);
+        if (timed) {
+            const double filtered = m_speed * std::exp(-dt / tuning.velocityTime) + speed * alpha;
+            m_speed = std::isfinite(filtered) ? filtered : std::max(m_speed, speed);
+        }
         const double delta = rawDelta * gain;
         const double old = position;
         position = std::clamp(position + delta, 0.0, path.end());
-        if (!timed) {
+        // Millisecond timestamps can repeat. Preserve direct displacement
+        // and the estimator for those packets instead of dividing by zero
+        // or erasing a valid fling because two events share a timestamp.
+        if (rawDelta * velocity < 0)
             velocity = 0;
-        } else {
+        if (timed) {
             const double instant = delta / dt;
-            // Discard old-direction momentum as soon as the fingers reverse.
-            if (instant * velocity < 0)
-                velocity = 0;
-            velocity += alpha * (instant - velocity);
-            if (position == old && delta != 0)
-                velocity = 0;
+            velocity = std::isfinite(instant) ? velocity + alpha * (instant - velocity) : 0;
         }
+        if (position == old && delta != 0)
+            velocity = 0;
     }
     void release(double staleSeconds, double viewport) {
         if (phase != Phase::Dragging)
             return;
-        if (!std::isfinite(staleSeconds) || staleSeconds > 0.1)
+        // Bound the estimator before ageing it. Otherwise an arbitrarily
+        // large/batched sample can outlive a pause and still launch a full
+        // maximum-distance fling after the fingers have stopped.
+        const double cap = std::max(0.0, viewport * tuning.inertia * tuning.friction);
+        velocity = std::clamp(velocity, -cap, cap);
+        if (!std::isfinite(staleSeconds))
             velocity = 0;
         else
             velocity *= std::exp(-std::max(0.0, staleSeconds) / tuning.velocityTime);
-        const double cap = std::max(0.0, viewport * tuning.inertia * tuning.friction);
-        velocity = std::clamp(velocity, -cap, cap);
         phase = std::abs(velocity) > 25 ? Phase::Coasting : Phase::Settling;
         if (phase == Phase::Settling)
             settle();

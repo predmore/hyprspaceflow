@@ -7,11 +7,11 @@ PREFIX ?= $(HOME)/.local
 
 all: hyprspaceflow.so
 
-hyprspaceflow.so: src/Plugin.cpp src/Motion.hpp
+hyprspaceflow.so: src/Plugin.cpp src/Motion.hpp src/SpeedGain.hpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -shared src/Plugin.cpp -o $@.tmp $(shell pkg-config --libs lua)
 	mv $@.tmp $@
 
-build/motion-test: tests/motion.cpp src/Motion.hpp
+build/motion-test: tests/motion.cpp src/Motion.hpp src/SpeedGain.hpp
 	mkdir -p build
 	$(CXX) -std=c++23 -O2 -g -Wall -Wextra -Werror tests/motion.cpp -o $@
 

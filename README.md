@@ -8,8 +8,9 @@ traverse further workspaces. Reverse anywhere to follow the same path back.
 
 Position tracks the gesture directly. A smooth speed-dependent gain helps
 longer swipes travel further; release adds a short, bounded exponential coast,
-followed by critically damped settling. A new swipe catches motion at its
-current position. No timer polls while idle, no external gesture daemon, and
+followed by critically damped settling. A raw swipe-begin catches motion at its
+current position, before Hyprland classifies the horizontal direction. No timer
+polls while idle, no external gesture daemon, and
 no machine-code hooks are used.
 
 **Early experimental release.** Built and replay-tested against **Hyprland
@@ -108,8 +109,11 @@ For a more literal feel, set `acceleration = 0`. For less glide, reduce `inertia
 to `0.25` or increase `friction` to `12`.
 
 Release velocity is filtered over 45 ms, discarded on direction reversal,
-and suppressed when the fingers pause before release. Both coasting and
-settling use analytical, time-based integration. Position during contact is
+and decays smoothly when the fingers pause before release. The acceleration
+gain is integrated across each input packet so the same finger motion travels
+the same distance across touchpad input rates. Both coasting and
+settling use analytical, time-based integration, including short frame stalls.
+Position during contact is
 not smoothed: layout geometry is warped to the finger position rather than
 chasing it through a compositor animation.
 
@@ -121,18 +125,26 @@ chasing it through a compositor animation.
   their right edge. Reversed horizontal tapes are supported too.
 - Empty workspaces and other layouts each occupy a complete workspace page;
   vertical scrolling layouts use this same page fallback.
+- Covering fullscreen windows are one page too: hidden columns do not consume
+  invisible scrolling distance before the workspace starts moving.
 - A workspace transition occupies one monitor width. Only the outgoing and
   incoming workspaces are force-rendered. The active workspace changes at the
   midpoint; keyboard focus follows the final viewport on completion.
 - Special workspaces and locked sessions are left to Hyprland.
-- Config reloads, monitor changes, window topology changes, other workspace
-  switches, keyboard input, and clicks interrupt motion and release rendering
+- Background window activity refreshes unseen pages without moving the view
+  held under your fingers. The captured workspace list stays fixed until the
+  next gesture; removed or transferred background pages are released safely.
+- Config reloads, changes to the visible layout, other workspace switches,
+  keyboard input, and clicks interrupt motion and release rendering
   ownership. A cancelled gesture drops inertia and settles at the nearest
   workspace edge, preserving the scrolling distance already travelled.
+- Finishing or interrupting the gesture reconciles keyboard focus with the
+  visible workspace. Explicit user focus changes keep their chosen target.
 
-The workspace path is sampled when the swipe starts. This keeps a moving
-target from shifting under the fingers; changes to window topology interrupt
-the gesture instead of silently changing its distance.
+New three-finger contact pauses kinetic motion at the raw swipe-begin event.
+If it becomes a horizontal gesture, motion resumes from that exact position.
+If it ends or becomes another gesture, the held view settles without an extra
+fling. This describes compositor event handling, not measured sensor latency.
 
 ## Diagnostics and testing
 
@@ -143,9 +155,12 @@ make test
 ```
 
 `status()` also returns position, velocity, viewport width, and per-workspace
-tape/render state. `start(event)`, `update(event)`, and `finish(event)` accept
+tape/render state, controller inhibition, and the last interruption reason.
+`start(event)`, `update(event)`, and `finish(event)` accept
 the same tables supplied by Hyprland's Lua gesture callbacks, making recorded
 input replay possible without touchpad hardware.
+`raw_begin(event)` and `raw_finish(event)` replay the same raw contact path
+used by the compositor's swipe-begin/end listeners.
 
 The portable tests cover multi-workspace traversal, reversals, direct tracking,
 momentum catching, stale release velocity, partial-boundary settling, refresh
@@ -160,6 +175,7 @@ windows on workspace 1. Then run:
 
 ```sh
 python3 tests/integration.py --instance THE_NESTED_INSTANCE_SIGNATURE
+python3 tests/review_integration.py --instance THE_NESTED_INSTANCE_SIGNATURE
 ```
 
 `examples/nested.lua` supplies this fixture when Foot is installed. Launch it
@@ -173,6 +189,8 @@ F12 exits the nested session. Use `hyprctl instances` to find its signature.
 
 The replay runner refuses to target the instance in your current environment.
 See [validation notes](docs/VALIDATION.md) for the checks run on this release.
+The [independent review](docs/REVIEW.md) records the two rounds that brought
+the reviewed software behavior to 9.5/10, including the remaining evidence limits.
 
 ## License
 

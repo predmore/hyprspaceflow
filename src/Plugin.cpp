@@ -5,6 +5,7 @@
 #include <hyprland/src/config/values/types/BoolValue.hpp>
 #include <hyprland/src/config/values/types/FloatValue.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/layout/algorithm/Algorithm.hpp>
@@ -12,6 +13,8 @@
 #include <hyprland/src/layout/space/Space.hpp>
 #include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
+#include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/input/UnifiedWorkspaceSwipeGesture.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/render/Renderer.hpp>
@@ -46,6 +49,7 @@ SP<ScrollData> scrollData(Scrolling* algorithm) {
 }
 
 struct Workspace {
+    PHLWORKSPACE retained;
     PHLWORKSPACEREF workspace;
     WP<ScrollData> data;
     double savedOffset = 0;
@@ -63,19 +67,40 @@ class Runtime {
     PHLWORKSPACEREF expected;
     Clock::time_point lastFrame{}, lastInput{};
     uint32_t timestamp = 0;
-    bool active = false, applying = false, hasTime = false;
-    bool savedScanoutBlock = false;
+    bool active = false, applying = false, hasTime = false, geometryDirty = false, awaitingGesture = false;
+    uint32_t gestureFingers = 3;
+    const char* lastStop = "none";
+    bool scanoutOverride = false, scanoutPrevious = false;
+    UP<SEventLoopDoLaterLock> scanoutLater;
+    UP<SEventLoopDoLaterLock> focusLater;
+    UP<SEventLoopDoLaterLock> topologyLater;
+    PHLMONITORREF pendingFocusMonitor;
+    PHLWORKSPACEREF pendingFocusWorkspace;
     std::vector<CHyprSignalListener> listeners;
 
     Runtime() {
         auto& events = Event::bus()->m_events;
+        listeners.emplace_back(events.render.preChecks.listen([this](PHLMONITOR m) {
+            scanoutLater.reset();
+            restoreScanout();
+            if (!active || m != monitor.lock()) return;
+            // Keep this override inside a single synchronous render check,
+            // rather than restoring a stale global snapshot after a long swipe.
+            scanoutPrevious = g_pHyprRenderer->m_directScanoutBlocked;
+            scanoutOverride = true;
+            g_pHyprRenderer->m_directScanoutBlocked = true;
+            scanoutLater = g_pEventLoopManager->doLaterLock([this]() { restoreScanout(); });
+        }));
         listeners.emplace_back(events.render.pre.listen([this](PHLMONITOR m) {
-            if (!active || m != monitor.lock() || motion.phase == flow::Phase::Dragging)
+            restoreScanout(); // The scanout gate has passed; other plugins own their state again.
+            if (!active || m != monitor.lock())
                 return;
-            if (!valid()) {
-                abort();
+            if (!prepare()) {
+                abort(true, true, "geometry_changed");
                 return;
             }
+            if (motion.phase == flow::Phase::Dragging)
+                return;
             const auto now = Clock::now();
             const double dt = std::chrono::duration<double>(now - lastFrame).count();
             lastFrame = now;
@@ -84,38 +109,90 @@ class Runtime {
                 motion.velocity = 0;
                 motion.settle();
             }
-            motion.tick(std::min(dt, 0.05));
+            motion.tick(dt > 0.25 ? 0.0 : dt);
             apply();
             if (motion.phase == flow::Phase::Idle)
                 finish();
         }));
         listeners.emplace_back(events.workspace.active.listen([this](PHLWORKSPACE ws) {
-            if (active && !applying && ws != expected.lock())
-                abort();
+            const auto m = monitor.lock();
+            if (active && !applying && m && m->m_activeWorkspace != expected.lock())
+                abort(false, false, "workspace_switch");
         }));
-        listeners.emplace_back(events.workspace.specialActive.listen([this](PHLWORKSPACE, PHLMONITOR) { abort(); }));
-        listeners.emplace_back(events.workspace.removed.listen([this](PHLWORKSPACEREF) { if (!applying) abort(); }));
-        listeners.emplace_back(events.workspace.created.listen([this](PHLWORKSPACEREF) { if (!applying) abort(); }));
-        listeners.emplace_back(events.workspace.moveToMonitor.listen([this](PHLWORKSPACE, PHLMONITOR) { abort(); }));
-        listeners.emplace_back(events.monitor.preRemoved.listen([this](PHLMONITOR) { abort(); }));
-        listeners.emplace_back(events.monitor.layoutChanged.listen([this]() { abort(); }));
+        listeners.emplace_back(events.workspace.specialActive.listen([this](PHLWORKSPACE, PHLMONITOR m) { if (m == monitor.lock()) abort(false); }));
+        listeners.emplace_back(events.workspace.removed.listen([this](PHLWORKSPACEREF ws) {
+            if (active && !applying) { geometryDirty = true; damage(); }
+        }));
+        listeners.emplace_back(events.workspace.moveToMonitor.listen([this](PHLWORKSPACE ws, PHLMONITOR) {
+            if (active && !applying) { geometryDirty = true; damage(); }
+        }));
+        listeners.emplace_back(events.monitor.preRemoved.listen([this](PHLMONITOR m) { if (m == monitor.lock()) abort(false); }));
+        listeners.emplace_back(events.monitor.layoutChanged.listen([this]() {
+            if (active && monitor && std::abs(monitor->m_size.x - motion.path.gap) > 0.1) abort();
+        }));
         listeners.emplace_back(events.monitor.focused.listen([this](PHLMONITOR m) {
-            if (active && m != monitor.lock()) abort();
+            if (active && m != monitor.lock()) abort(false);
         }));
         listeners.emplace_back(events.config.preReload.listen([this]() { abort(); }));
-        listeners.emplace_back(events.window.open.listen([this](PHLWINDOW) { if (!applying) abort(); }));
-        listeners.emplace_back(events.window.close.listen([this](PHLWINDOW) { if (!applying) abort(); }));
-        listeners.emplace_back(events.window.moveToWorkspace.listen([this](PHLWINDOW, PHLWORKSPACE) { if (!applying) abort(); }));
-        listeners.emplace_back(events.window.floating.listen([this](PHLWINDOW) { if (!applying) abort(); }));
-        listeners.emplace_back(events.window.fullscreen.listen([this](PHLWINDOW) { if (!applying) abort(); }));
-        listeners.emplace_back(events.window.active.listen([this](PHLWINDOW, Desktop::eFocusReason) { if (!applying) abort(); }));
+        listeners.emplace_back(events.window.open.listen([this](PHLWINDOW w) { topology(w); }));
+        listeners.emplace_back(events.window.close.listen([this](PHLWINDOW w) { topology(w); }));
+        listeners.emplace_back(events.window.moveToWorkspace.listen([this](PHLWINDOW w, PHLWORKSPACE) { topology(w); }));
+        listeners.emplace_back(events.window.floating.listen([this](PHLWINDOW w) { topology(w); }));
+        listeners.emplace_back(events.window.fullscreen.listen([this](PHLWINDOW w) { topology(w); }));
+        listeners.emplace_back(events.window.updateRules.listen([this](PHLWINDOW w) { topology(w); }));
+        listeners.emplace_back(events.window.active.listen([this](PHLWINDOW w, Desktop::eFocusReason reason) {
+            const bool explicitFocus = reason == Desktop::FOCUS_REASON_KEYBIND || reason == Desktop::FOCUS_REASON_DISPATCH_FOCUSWINDOW ||
+                reason == Desktop::FOCUS_REASON_DISPATCH_MOVEWINDOWINTOGROUP || reason == Desktop::FOCUS_REASON_CLICK ||
+                reason == Desktop::FOCUS_REASON_SWITCH_TO_WINDOW_HARD || reason == Desktop::FOCUS_REASON_SWITCH_TO_WINDOW_SOFT ||
+                reason == Desktop::FOCUS_REASON_GROUP_CURRENT_WINDOW_CHANGE;
+            if (!active || applying || !w || w->m_workspace != expected.lock() || !explicitFocus)
+                return;
+            // Explicit focus changes belong to the user. Release our viewport
+            // lock, then let the native layout reveal their chosen window.
+            const auto ws = w->m_workspace;
+            abort(false, false, "explicit_focus");
+            if (ws && ws->m_space) ws->m_space->recalculate(Layout::RECALCULATE_REASON_WORKSPACE_CHANGE);
+        }));
         listeners.emplace_back(events.input.keyboard.key.listen([this](IKeyboard::SKeyEvent, Event::SCallbackInfo&) { stopForInput(); }));
         listeners.emplace_back(events.input.mouse.button.listen([this](IPointer::SButtonEvent, Event::SCallbackInfo&) { stopForInput(); }));
         if (g_pSessionLockManager)
-            listeners.emplace_back(g_pSessionLockManager->m_events.lock.listen([this]() { abort(); }));
+            listeners.emplace_back(g_pSessionLockManager->m_events.lock.listen([this]() { abort(false); }));
+        listeners.emplace_back(events.gesture.swipe.begin.listen([this](IPointer::SSwipeBeginEvent e, Event::SCallbackInfo&) { rawBegin(e.timeMs, e.fingers); }));
+        listeners.emplace_back(events.gesture.swipe.end.listen([this](IPointer::SSwipeEndEvent e, Event::SCallbackInfo&) { rawFinish(e.timeMs, e.cancelled); }));
     }
 
-    ~Runtime() { abort(); }
+    ~Runtime() {
+        topologyLater.reset();
+        scanoutLater.reset();
+        restoreScanout();
+        flushFocus();
+        if (active) finish();
+    }
+
+    void restoreScanout() {
+        if (!scanoutOverride) return;
+        g_pHyprRenderer->m_directScanoutBlocked = scanoutPrevious;
+        scanoutOverride = false;
+    }
+
+    static void releaseController(const Workspace& state) {
+        if (!state.touched) return;
+        if (const auto data = state.data.lock()) {
+            auto& inhibit = data->controller->getScrollInhibitor();
+            inhibit.isInhibited = state.savedInhibition;
+            inhibit.offsetWhenInhibited = data->controller->getOffset();
+        }
+    }
+
+    static void releaseVisual(const Workspace& state) {
+        if (!state.touched) return;
+        if (const auto ws = state.workspace.lock()) {
+            const auto owner = ws->m_monitor.lock();
+            ws->m_forceRendering = state.savedForce;
+            ws->m_renderOffset->setValueAndWarp(Vector2D{});
+            ws->m_alpha->setValueAndWarp(owner && owner->m_activeWorkspace == ws ? 1.F : state.savedAlpha);
+        }
+    }
 
     bool valid() const {
         const auto m = monitor.lock();
@@ -124,23 +201,90 @@ class Runtime {
             return false;
         if (m->m_activeWorkspace != expected.lock())
             return false;
-        for (const auto& state : workspaces) {
-            const auto ws = state.workspace.lock();
-            if (!::valid(ws) || ws->m_monitor.lock() != m)
-                return false;
-            // Layout replacement destroys the old data; never retain an
-            // algorithm pointer across callbacks or a config reload.
-            if (state.hadData && (!state.data || scrollData(scrolling(ws)) != state.data.lock()))
-                return false;
-            if (const auto data = state.data.lock(); data &&
-                (data->columns.size() != state.columns || std::abs(data->maxWidth() - state.extent) > 0.1))
-                return false;
+        return true;
+    }
+
+    bool visible(const PHLWORKSPACE& ws) const {
+        if (!active || workspaces.empty()) return false;
+        const auto s = motion.path.sample(motion.position);
+        return workspaces[s.left].workspace.lock() == ws || (s.transition && workspaces[s.right].workspace.lock() == ws);
+    }
+
+    void topology(const PHLWINDOW& w) {
+        if (!active || applying || !w) return;
+        // Moving a window can also change its old workspace. Refresh all
+        // captured page geometry, without treating background work as input.
+        geometryDirty = true;
+        damage();
+        // Window signals may precede the layout mutation. Validate after the
+        // current operation completes, even if the output is temporarily not
+        // producing frames (for example, a covered nested compositor).
+        topologyLater = g_pEventLoopManager->doLaterLock([this]() {
+            if (active && geometryDirty && !prepare())
+                abort(true, true, "visible_topology");
+        });
+    }
+
+    bool prepare() {
+        if (!valid()) return false;
+        const auto anchor = motion.path.sample(motion.position);
+        if (!geometryDirty) {
+            for (size_t i : {anchor.left, anchor.right}) {
+                const auto& state = workspaces[i];
+                const auto ws = state.workspace.lock();
+                if (!::valid(ws) || (state.hadData && (!state.data || scrollData(scrolling(ws)) != state.data.lock())))
+                    return false;
+                if (const auto data = state.data.lock(); data && (data->columns.size() != state.columns || std::abs(data->maxWidth() - state.extent) > .1))
+                    return false;
+            }
+            return true;
         }
+        const auto left = workspaces[anchor.left].workspace.lock();
+        const auto right = workspaces[anchor.right].workspace.lock();
+        std::vector<Workspace> refreshed;
+        flow::Path path;
+        path.gap = motion.path.gap;
+        size_t leftIndex = 0;
+        for (size_t i = 0; i < workspaces.size(); ++i) {
+            auto state = workspaces[i];
+            const auto ws = state.workspace.lock();
+            if (!::valid(ws) || ws->m_monitor.lock() != monitor.lock()) {
+                if (ws == left || ws == right) return false;
+                releaseController(workspaces[i]);
+                releaseVisual(workspaces[i]);
+                continue;
+            }
+            state.data.reset();
+            state.hadData = false;
+            state.extent = 0;
+            state.columns = 0;
+            const auto page = pageFor(ws, state);
+            if (state.touched && state.data.lock() == workspaces[i].data.lock()) {
+                state.savedInhibition = workspaces[i].savedInhibition;
+            } else {
+                releaseController(workspaces[i]);
+            }
+            if (ws == left || ws == right) {
+                const auto& old = motion.path.pages[i];
+                if (page.low != old.low || page.high != old.high || state.data.lock() != workspaces[i].data.lock())
+                    return false;
+            }
+            if (ws == left) leftIndex = refreshed.size();
+            refreshed.push_back(state);
+            path.pages.push_back(page);
+        }
+        const double nextPosition = path.start(leftIndex) + (anchor.transition ? path.length(leftIndex) + anchor.progress * path.gap : anchor.leftOffset - path.pages[leftIndex].low);
+        motion.rebase(nextPosition - motion.position);
+        motion.path = std::move(path);
+        workspaces = std::move(refreshed);
+        geometryDirty = false;
         return true;
     }
 
     flow::Page pageFor(const PHLWORKSPACE& ws, Workspace& state) {
         flow::Page page;
+        if (Fullscreen::controller()->hasFullscreen(ws))
+            return page; // A covering fullscreen is one visible page, not hidden tape distance.
         const auto algorithm = scrolling(ws);
         const auto data = scrollData(algorithm);
         if (!data || !data->controller || !data->controller->isPrimaryHorizontal())
@@ -189,13 +333,14 @@ class Runtime {
         return page;
     }
 
-    bool begin(uint32_t time) {
+    bool begin(uint32_t time, uint32_t fingers = 3) {
+        flushFocus();
         const auto m = Desktop::focusState()->monitor();
         if (!m || m->m_activeSpecialWorkspace || !m->m_activeWorkspace ||
             (g_pSessionLockManager && g_pSessionLockManager->isSessionLocked()) ||
             g_pUnifiedWorkspaceSwipe->isGestureInProgress())
             return false;
-        if (active && monitor.lock() == m && valid()) {
+        if (active && monitor.lock() == m && prepare()) {
             motion.grab(); // catch momentum at its exact visible position
         } else {
             abort();
@@ -211,6 +356,7 @@ class Runtime {
             std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a->m_id < b->m_id; });
             for (const auto& ws : ordered) {
                 Workspace state;
+                state.retained = ws;
                 state.workspace = ws;
                 state.savedAlpha = ws->m_alpha->value();
                 state.savedForce = ws->m_forceRendering;
@@ -228,23 +374,39 @@ class Runtime {
                 return false;
             motion.grab();
             active = true;
-            // Direct scanout bypasses render.pre entirely. Keep the compositor
-            // rendering while this interaction owns animated geometry.
-            savedScanoutBlock = g_pHyprRenderer->m_directScanoutBlocked;
-            g_pHyprRenderer->m_directScanoutBlocked = true;
         }
         motion.tuning = {sensitivity->value(), acceleration->value(), accelSpeed->value(), 0.045,
                          friction->value(), inertia->value(), spring->value(), snapColumns->value()};
+        awaitingGesture = false;
+        lastStop = "none";
+        gestureFingers = fingers;
+        geometryDirty = false;
         timestamp = time;
         hasTime = true;
         lastFrame = lastInput = Clock::now();
         return true;
     }
 
+    void rawBegin(uint32_t time, uint32_t fingers) {
+        if (!active || fingers != gestureFingers || motion.phase == flow::Phase::Dragging)
+            return;
+        if (!prepare()) { abort(); return; }
+        motion.grab();
+        awaitingGesture = true;
+        timestamp = time;
+        lastInput = Clock::now();
+    }
+
+    void rawFinish(uint32_t time, bool cancelled) {
+        if (!active || !awaitingGesture) return;
+        awaitingGesture = false;
+        release(time, true); // No horizontal gesture claimed the paused contact.
+    }
+
     void update(double dx, uint32_t time) {
         if (!active || motion.phase != flow::Phase::Dragging)
             return;
-        if (!valid()) {
+        if (!prepare()) {
             abort();
             return;
         }
@@ -263,7 +425,7 @@ class Runtime {
     void release(uint32_t time, bool cancelled) {
         if (!active)
             return;
-        if (!valid()) {
+        if (!prepare()) {
             abort();
             return;
         }
@@ -272,9 +434,13 @@ class Runtime {
         // libinput cancellation ends contact; it is not an undo of every
         // window/workspace already traversed. Drop momentum and settle at
         // the current boundary instead of restoring the initial tape.
-        if (cancelled)
+        if (cancelled) {
             motion.velocity = 0;
-        motion.release(cancelled ? 1.0 : std::max(eventAge, wallAge), motion.path.gap);
+            motion.settle();
+        } else {
+            motion.release(std::max(eventAge, wallAge), motion.path.gap);
+        }
+        awaitingGesture = false;
         lastFrame = Clock::now();
         damage();
     }
@@ -300,6 +466,9 @@ class Runtime {
         controller.getScrollInhibitor().isInhibited = false;
         controller.setOffset(controller.isReversed() ? -offset : offset);
         data->recalculate(true); // warp geometry: no compositor easing behind the fingers
+        // Native focus-following must not pull the viewport away from contact.
+        controller.getScrollInhibitor().offsetWhenInhibited = controller.getOffset();
+        controller.getScrollInhibitor().isInhibited = true;
     }
 
     void apply() {
@@ -351,19 +520,13 @@ class Runtime {
         for (auto& state : workspaces) {
             if (!state.touched)
                 continue;
-            if (const auto ws = state.workspace.lock()) {
-                ws->m_forceRendering = state.savedForce;
-                ws->m_renderOffset->setValueAndWarp(Vector2D{});
-                ws->m_alpha->setValueAndWarp(m && m->m_activeWorkspace == ws ? 1.F : state.savedAlpha);
-            }
-            if (const auto data = state.data.lock()) {
-                auto& inhibit = data->controller->getScrollInhibitor();
-                inhibit.isInhibited = state.savedInhibition;
-                inhibit.offsetWhenInhibited = data->controller->getOffset();
-            }
+            releaseVisual(state);
+            releaseController(state);
         }
         active = false;
-        g_pHyprRenderer->m_directScanoutBlocked = savedScanoutBlock;
+        awaitingGesture = false;
+        geometryDirty = false;
+        restoreScanout();
         motion.phase = flow::Phase::Idle;
         workspaces.clear();
         damage();
@@ -371,24 +534,46 @@ class Runtime {
         expected.reset();
     }
 
-    void finish() {
-        if (!active)
+    static void focusWorkspace(const PHLMONITOR& m, const PHLWORKSPACE& ws) {
+        if (!m || !::valid(ws) || m->m_activeWorkspace != ws || m->m_activeSpecialWorkspace ||
+            Desktop::focusState()->monitor() != m || (g_pSessionLockManager && g_pSessionLockManager->isSessionLocked()))
             return;
-        const auto m = monitor.lock();
-        const auto ws = m ? m->m_activeWorkspace : nullptr;
-        applying = true;
-        if (auto* algorithm = scrolling(ws)) {
+        if (const auto fullscreen = Fullscreen::controller()->getFullscreenWindow(ws)) {
+            Desktop::focusState()->fullWindowFocus(fullscreen, Desktop::FOCUS_REASON_WORKSPACE_CHANGE);
+        } else if (auto* algorithm = scrolling(ws); algorithm && scrollData(algorithm)) {
             const auto data = scrollData(algorithm);
             const double offset = data ? data->controller->getOffset() : 0;
+            const bool inhibited = data && data->controller->getScrollInhibitor().isInhibited;
             algorithm->focusColumn(algorithm->getColumnAtViewportCenter());
             if (data) {
                 data->controller->getScrollInhibitor().isInhibited = false;
                 data->controller->setOffset(offset);
                 data->recalculate(true);
+                data->controller->getScrollInhibitor().offsetWhenInhibited = offset;
+                data->controller->getScrollInhibitor().isInhibited = inhibited;
             }
         } else if (ws) {
             Desktop::focusState()->fullWindowFocus(ws->getFocusCandidate(), Desktop::FOCUS_REASON_WORKSPACE_CHANGE);
         }
+    }
+
+    void flushFocus() {
+        focusLater.reset();
+        const auto m = pendingFocusMonitor.lock();
+        const auto ws = pendingFocusWorkspace.lock();
+        pendingFocusMonitor.reset();
+        pendingFocusWorkspace.reset();
+        const bool before = applying;
+        applying = true;
+        focusWorkspace(m, ws);
+        applying = before;
+    }
+
+    void finish() {
+        if (!active) return;
+        const auto m = monitor.lock();
+        applying = true;
+        focusWorkspace(m, m ? m->m_activeWorkspace : nullptr);
         applying = false;
         cleanup();
     }
@@ -402,9 +587,27 @@ class Runtime {
         finish();
     }
 
-    void abort() {
-        if (active)
-            cleanup();
+    void abort(bool reconcile = true, bool defer = false, const char* reason = "cancel") {
+        if (!active) return;
+        lastStop = reason;
+        const auto m = monitor.lock();
+        const auto ws = m ? m->m_activeWorkspace : nullptr;
+        if (reconcile && !defer) {
+            finish();
+            return;
+        }
+        cleanup();
+        if (reconcile) {
+            pendingFocusMonitor = m;
+            pendingFocusWorkspace = ws;
+            focusLater = g_pEventLoopManager->doLaterLock([this]() {
+                const auto m = pendingFocusMonitor.lock();
+                const auto ws = pendingFocusWorkspace.lock();
+                pendingFocusMonitor.reset();
+                pendingFocusWorkspace.reset();
+                focusWorkspace(m, ws);
+            });
+        }
     }
 };
 
@@ -419,7 +622,11 @@ uint32_t timeField(lua_State* L) {
 
 int start(lua_State* L) {
     luaL_checktype(L, 1, LUA_TTABLE);
-    const bool started = runtime && runtime->begin(timeField(L));
+    const auto time = timeField(L);
+    lua_getfield(L, 1, "fingers");
+    const auto fingers = static_cast<uint32_t>(luaL_optinteger(L, -1, 3));
+    lua_pop(L, 1);
+    const bool started = runtime && runtime->begin(time, fingers);
     lua_pushboolean(L, started);
     return 1;
 }
@@ -447,15 +654,36 @@ int cancel(lua_State*) {
     if (runtime) runtime->abort();
     return 0;
 }
+int rawBegin(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    const auto time = timeField(L);
+    lua_getfield(L, 1, "fingers");
+    const auto fingers = static_cast<uint32_t>(luaL_checkinteger(L, -1));
+    lua_pop(L, 1);
+    if (runtime) runtime->rawBegin(time, fingers);
+    return 0;
+}
+int rawFinish(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    const auto time = timeField(L);
+    lua_getfield(L, 1, "cancelled");
+    const bool cancelled = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    if (runtime) runtime->rawFinish(time, cancelled);
+    return 0;
+}
 int status(lua_State* L) {
     lua_newtable(L);
     lua_pushboolean(L, runtime && runtime->active); lua_setfield(L, -2, "active");
+    lua_pushboolean(L, runtime && runtime->awaitingGesture); lua_setfield(L, -2, "awaiting_gesture");
+    lua_pushstring(L, runtime ? runtime->lastStop : "none"); lua_setfield(L, -2, "last_stop");
     lua_pushnumber(L, runtime ? runtime->motion.position : 0); lua_setfield(L, -2, "position");
     lua_pushnumber(L, runtime ? runtime->motion.velocity : 0); lua_setfield(L, -2, "velocity");
     const char* phases[] = {"idle", "dragging", "coasting", "settling"};
     lua_pushstring(L, phases[runtime ? static_cast<int>(runtime->motion.phase) : 0]); lua_setfield(L, -2, "phase");
     lua_pushinteger(L, runtime ? runtime->workspaces.size() : 0); lua_setfield(L, -2, "workspaces");
     lua_pushboolean(L, g_pHyprRenderer->m_directScanoutBlocked); lua_setfield(L, -2, "scanout_blocked");
+    lua_pushboolean(L, runtime && runtime->active); lua_setfield(L, -2, "compositing_required");
     lua_pushnumber(L, runtime ? runtime->motion.path.gap : 0); lua_setfield(L, -2, "viewport");
     lua_newtable(L);
     int index = 1;
@@ -468,6 +696,7 @@ int status(lua_State* L) {
         lua_pushnumber(L, ws->m_alpha->value()); lua_setfield(L, -2, "alpha");
         if (const auto data = scrollData(scrolling(ws.lock()))) {
             lua_pushnumber(L, data->controller->getOffset()); lua_setfield(L, -2, "tape");
+            lua_pushboolean(L, data->controller->getScrollInhibitor().isInhibited); lua_setfield(L, -2, "inhibited");
         }
         if (runtime && runtime->active) {
             for (size_t i = 0; i < runtime->workspaces.size(); ++i) {
@@ -516,11 +745,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
         !HyprlandAPI::addLuaFunction(handle, "hyprspaceflow", "update", update) ||
         !HyprlandAPI::addLuaFunction(handle, "hyprspaceflow", "finish", end) ||
         !HyprlandAPI::addLuaFunction(handle, "hyprspaceflow", "cancel", cancel) ||
+        !HyprlandAPI::addLuaFunction(handle, "hyprspaceflow", "raw_begin", rawBegin) ||
+        !HyprlandAPI::addLuaFunction(handle, "hyprspaceflow", "raw_finish", rawFinish) ||
         !HyprlandAPI::addLuaFunction(handle, "hyprspaceflow", "status", status)) {
         runtime.reset();
         throw std::runtime_error("hyprspaceflow: Lua registration failed");
     }
-    return {"hyprspaceflow", "Continuous scrolling-to-workspace swipes with inertia", "predmore", "0.1.1"};
+    return {"hyprspaceflow", "Continuous scrolling-to-workspace swipes with inertia", "predmore", "0.2.0"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

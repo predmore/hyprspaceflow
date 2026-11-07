@@ -7,12 +7,15 @@ on workspace 1. Does not target the caller's main compositor instance.
 import argparse
 import json
 import os
+import re
 import subprocess
 import time
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--instance', required=True)
 args = parser.parse_args()
+if not re.fullmatch(r'[0-9a-f]{40}_\d+_\d+', args.instance):
+    parser.error('Use the complete disposable instance signature, never a numeric alias.')
 if args.instance == os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
     parser.error('Use a disposable nested instance, not your current desktop.')
 
@@ -38,6 +41,12 @@ def wait_idle():
             return
         time.sleep(.03)
     raise AssertionError('release did not settle')
+
+# Verify the disposable fixture before changing any compositor state.
+workspace_info = {w['id']: w for w in json.loads(ctl('-j', 'workspaces'))}
+assert all(workspace_info.get(i, {}).get('ispersistent') for i in range(1, 5)), 'Need disposable persistent workspaces 1..4'
+clients = json.loads(ctl('-j', 'clients'))
+assert sum(w['workspace']['id'] == 1 and w['class'] == 'hyprspaceflow-test' and not w['floating'] for w in clients) >= 3, 'Need the disposable nested Foot fixture'
 
 lua('''
 function flow_test_clean(nativeSwitch)
@@ -65,14 +74,12 @@ hl.dispatch(hl.dsp.focus({workspace="1"}))
 flow_test_baseline = {}
 for _, p in ipairs(hl.plugin.hyprspaceflow.status().pages) do flow_test_baseline[p.id] = p.render_x end
 ''')
-clients = json.loads(ctl('-j', 'clients'))
-assert sum(w['workspace']['id'] == 1 and not w['floating'] for w in clients) >= 3, 'Need 3+ fixture windows on workspace 1'
 
 case('direct tracking, edge handoff and complete reverse', '''
 local p = hl.plugin.hyprspaceflow
 assert(p.start({time_ms=1000}))
 local s = p.status()
-assert(s.scanout_blocked, "animated geometry must inhibit direct scanout")
+assert(s.compositing_required, "animated geometry must require composited frames")
 p.update({time_ms=1010,delta={x=s.position}})
 assert(math.abs(p.status().position) < .01)
 local before = flow_test_page(1).tape
@@ -212,7 +219,7 @@ local page=flow_test_page(1)
 flow_test_edge=page.high
 local goal=page.start+page.high-page.low+p.status().viewport*{fraction}
 p.update({{time_ms=10010,delta={{x=-(goal-p.status().position)}}}})
-p.finish({{time_ms=10200,cancelled={str(cancelled).lower()}}})
+p.finish({{time_ms=11010,cancelled={str(cancelled).lower()}}})
 ''')
             wait_idle()
             expected_workspace = 1 if fraction < .5 else 2

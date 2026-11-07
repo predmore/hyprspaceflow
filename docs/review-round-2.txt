@@ -1,0 +1,42 @@
+Independent review, round 2 — final assessment
+Date: November 6, 2026
+Reviewed staged tree: b3e84f0e27233f2f1d1e316d7a7a790a7b920145
+Version: 0.2.0
+
+Final score: 9.5 / 10 for the implemented swipe experience under the tested compositor scenarios.
+Weighted score before rounding: 9.535 / 10. The threshold of 9.5 is met.
+Recommendation: publish this reviewed build, subject to the ordinary matching-Hyprland-ABI requirement already documented.
+
+Rubric (same weights as round 1):
+- Direct tracking and acceleration: 25%, 9.6
+- Continuous boundaries and reversals: 25%, 9.7
+- Inertia, catching and settling: 20%, 9.5
+- Focus, interruptions, lifecycle integration: 20%, 9.5
+- Test credibility and operational clarity: 10%, 9.1
+
+Why the assessment improved from 7.8:
+- Position keeps the continuous concatenated path, including the reached far-right tape when a partial workspace transition settles back. Normal/cancelled releases on both sides of the midpoint are covered.
+- The acceleration gain is now integrated across the actual speed-filter trajectory. Independent numerical-quadrature tests support packet-independent accelerated displacement, including saturation crossings.
+- Release velocity now ages smoothly instead of falling off a 100 ms cliff. Maximum velocity is bounded before ageing, preventing an old huge input sample from launching a full fling after a pause.
+- The runtime integrates a normal 120 ms frame stall in full. The separate suspend guard suppresses stale travel after much longer gaps.
+- Raw swipe-begin holds kinetic motion before horizontal classification, and raw end releases a hold even when no horizontal gesture was claimed.
+- Abort, cancel, config reload and library unload reconcile keyboard focus with the visible workspace. Explicit user focus is distinguished from automatic/background focus changes.
+- Background page topology is refreshed and the continuous coordinate is rebased without displacing the held view or the private settling target. Visible topology changes abort safely and defer focus until layout mutation completes.
+- Old controller inhibition is restored when hidden pages become fullscreen, replace data, or leave the monitor. Removed pages also release their owned visual state.
+- Covering fullscreen windows are one visible page, avoiding invisible hidden-column travel. Strong workspace retention supports ordinary empty source workspaces during a swipe.
+- Direct-scanout inhibition is scoped to a synchronous render check, removing the long-lived global-state snapshot that could clobber another plugin.
+- Both replay entrypoints reject numeric instance aliases and validate disposable fixtures before mutating compositor state.
+
+Verification evidence:
+I independently inspected the staged source, matching Hyprland source interfaces, new tests and documentation, and verified the staged tree identity. I personally reran make test: 40,254 checks passed. I separately compiled and ran the motion suite with AddressSanitizer and UndefinedBehaviorSanitizer: 40,254 checks passed (LeakSanitizer disabled for the tracing sandbox). Python replay-runner syntax and staged whitespace checks passed.
+
+The implementer's compositor executions of the reviewer-authored regressions passed on a separate nested instance with a Wayland output and an additional actual headless output. I examined the assertions for: cancellation focus, background mapping/closing, visible topology interruption, fullscreen visible tracking, hidden fullscreen inhibition cleanup followed by native scrolling, moving a touched hidden workspace off-monitor, sparse nonpersistent empty source, raw catch/unclaimed-contact finish, a 120 ms stall, config reload and library unload/reload. The original suite and its eight normal/cancelled 49%/51% release combinations also passed.
+
+Remaining limits reflected in the score:
+- This is an evidence-based software-behavior review. Physical touchpad comfort and sensor-to-photon latency have not been measured with human usability or camera testing.
+- The release-velocity estimator retains a small input-packet residual: a representative 50 ms swipe at 1200 units/s produces about 1.25 logical pixels of different coast between 60 Hz and 240 Hz input. Accelerated displacement itself agrees with the independent reference. The limitation is documented rather than hidden.
+- Physical multi-monitor hardware, VRR timing, and broad third-party plugin coexistence have not been exercised. Multi-output state transfer was exercised in the disposable compositor with a headless output.
+- The plugin intentionally targets the validated Hyprland 0.56.2 ABI, and requires recompilation against matching compositor headers after upgrades.
+- Most of the 40,254 count consists of randomized bounds checks. The dedicated numerical, trajectory, focus and compositor scenario assertions carry the more important experience evidence.
+
+No unresolved high- or medium-priority blocker found in this final reviewed tree.

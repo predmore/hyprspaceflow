@@ -1,0 +1,33 @@
+Independent review, round 1
+Baseline: a6a9b21 (hyprspaceflow 0.1.1), November 6, 2026
+
+Overall engineering/experience readiness: 7.8 / 10. This is a code-and-replay-evidence assessment, not a physical touchpad usability measurement.
+
+Rubric (weight, score):
+- Direct tracking and acceleration: 25%, 8.2
+- Continuous boundaries and reversals: 25%, 8.5
+- Inertia, catching and settling: 20%, 7.5
+- Focus, interruptions, lifecycle integration: 20%, 6.5
+- Test credibility and operational clarity: 10%, 7.0
+Weighted total: 7.76 (rounded 7.8).
+
+Must fix or provide contrary replay evidence before a 9.5 recommendation:
+1. Abort paths can leave keyboard focus on a hidden source workspace. apply() switches the active workspace with noFocus=true, whereas abort() only calls cleanup(). Any explicit cancellation, topology interruption or reload after crossing the midpoint bypasses finish()'s focus reconciliation. Tests assert only workspace/transform state, never activewindow.workspace. Scope external-switch handling so legitimate external focus is preserved.
+2. Unrelated background activity aborts gestures. Every window open, close, floating/fullscreen or active event is observed globally without relevance checks. A background workspace or other monitor changing can terminate a swipe and remove workspace transforms abruptly. Relevance and safe revalidation should replace blanket cancellation.
+3. The runtime drops elapsed time at low frame rates: min(dt, 0.05) advances only 50ms during an ordinary 100ms frame. Independent probe: after 300ms of release at 10Hz, true-time integration reaches 1310.93, while the runtime-clipped equivalent reaches 1246.92 (64.01 logical pixel lag). Keep suspend handling separate from normal frame integration.
+4. Secondary adversarial audit is checking the release velocity cutoff and acceleration packetization. Those deserve regression evidence with default acceleration enabled; existing event-rate tracking tests disable acceleration.
+
+Additional integration evidence requested:
+- Fullscreen source containing several scrolling columns: covering fullscreen targets are fixed to monitor bounds or bypass recalc by native Hyprland. Counting all hidden columns in pageFor may create invisible gesture travel. Prefer a full-page fallback when tape movement cannot be visible.
+- Leaving an empty, nonpersistent active workspace: all current test workspaces are persistent, masking lifecycle invalidation of weak workspace references.
+- Explicit cancel plus window/monitor topology interruption: keyboard focus must match final visible workspace without stealing external app focus.
+- Raw swipe begin versus Lua classified start: Hyprland waits for 5 units before classifying and invoking Lua start. Existing code only catches inertia at that classified start, not on initial contact. Either implement raw contact capture or narrow claims and test names.
+
+Strengths:
+- Clean separation of deterministic motion from compositor integration.
+- Pixel-conserving concatenated path and reversible boundary mapping.
+- Exact exponential coast and critically damped settling within the motion core.
+- 0.1.1 cancelled-release regression meaningfully distinguishes old/new behavior.
+- Matching ABI rejection, atomic library replacement, unload-safe Lua namespace lookup.
+
+Evidence reviewed: implementation, tests, matching native scrolling/workspace/gesture sources. make test passes 40,047 checks. Physical touchpad feel, physical multi-monitor and VRR timing remain unmeasured. Most of the numeric check count is randomized finite/bounds assertions, so it is not equivalent to 40,047 distinct usability scenarios.
