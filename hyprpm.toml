@@ -1,0 +1,9 @@
+[repository]
+name = "hyprspaceflow"
+authors = ["predmore"]
+
+[hyprspaceflow]
+description = "Continuous scrolling-to-workspace swipes with acceleration and inertia"
+authors = ["predmore"]
+output = "hyprspaceflow.so"
+build = ["make all"]
