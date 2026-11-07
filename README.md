@@ -127,7 +127,8 @@ chasing it through a compositor animation.
 - Special workspaces and locked sessions are left to Hyprland.
 - Config reloads, monitor changes, window topology changes, other workspace
   switches, keyboard input, and clicks interrupt motion and release rendering
-  ownership. A cancelled gesture restores its initial workspace and tape offsets.
+  ownership. A cancelled gesture drops inertia and settles at the nearest
+  workspace edge, preserving the scrolling distance already travelled.
 
 The workspace path is sampled when the swipe starts. This keeps a moving
 target from shifting under the fingers; changes to window topology interrupt

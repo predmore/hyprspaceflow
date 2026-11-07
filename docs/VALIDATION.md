@@ -27,7 +27,7 @@ the scrolling fixture. `tests/integration.py` passed these replay checks:
 - Direct camera tracking without compositor animation lag.
 - Exact 25%/75% outgoing/incoming workspace translations at a boundary.
 - Crossing three workspace boundaries and reversing without another start.
-- Restoring the initial workspace and tape on gesture cancellation.
+- Releasing rendering ownership on explicit cancellation.
 - Visible inertia after release and catching it without a position jump.
 - Partial workspace transitions settling to an endpoint and becoming idle.
 - External workspace switches releasing gesture ownership.
@@ -44,6 +44,14 @@ issues: skipped-page cleanup on large input samples, and requesting the next
 release-animation frame before Hyprland marks the renderer active.
 
 ## Scope
+
+The 0.1.1 regression suite additionally releases at 49% and 51% of the
+workspace transition, with normal and cancelled end events in both directions.
+It starts with focus at the far-left window, enables column snapping and
+focus-following, then verifies that workspace 1 retains its rightmost tape
+offset after release. The old cancelled-end behavior reproduced a rewind to
+the initial offset; cancelled contact now suppresses inertia and settles at
+the current boundary instead.
 
 Replay tests exercise real compositor geometry and rendering state. They do
 not measure physical touchpad feel or frame pacing with a high-speed camera.

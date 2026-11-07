@@ -60,7 +60,7 @@ class Runtime {
     flow::Motion motion;
     std::vector<Workspace> workspaces;
     PHLMONITORREF monitor;
-    PHLWORKSPACEREF initial, expected;
+    PHLWORKSPACEREF expected;
     Clock::time_point lastFrame{}, lastInput{};
     uint32_t timestamp = 0;
     bool active = false, applying = false, hasTime = false;
@@ -73,7 +73,7 @@ class Runtime {
             if (!active || m != monitor.lock() || motion.phase == flow::Phase::Dragging)
                 return;
             if (!valid()) {
-                abort(false);
+                abort();
                 return;
             }
             const auto now = Clock::now();
@@ -91,31 +91,31 @@ class Runtime {
         }));
         listeners.emplace_back(events.workspace.active.listen([this](PHLWORKSPACE ws) {
             if (active && !applying && ws != expected.lock())
-                abort(false);
+                abort();
         }));
-        listeners.emplace_back(events.workspace.specialActive.listen([this](PHLWORKSPACE, PHLMONITOR) { abort(false); }));
-        listeners.emplace_back(events.workspace.removed.listen([this](PHLWORKSPACEREF) { if (!applying) abort(false); }));
-        listeners.emplace_back(events.workspace.created.listen([this](PHLWORKSPACEREF) { if (!applying) abort(false); }));
-        listeners.emplace_back(events.workspace.moveToMonitor.listen([this](PHLWORKSPACE, PHLMONITOR) { abort(false); }));
-        listeners.emplace_back(events.monitor.preRemoved.listen([this](PHLMONITOR) { abort(false); }));
-        listeners.emplace_back(events.monitor.layoutChanged.listen([this]() { abort(false); }));
+        listeners.emplace_back(events.workspace.specialActive.listen([this](PHLWORKSPACE, PHLMONITOR) { abort(); }));
+        listeners.emplace_back(events.workspace.removed.listen([this](PHLWORKSPACEREF) { if (!applying) abort(); }));
+        listeners.emplace_back(events.workspace.created.listen([this](PHLWORKSPACEREF) { if (!applying) abort(); }));
+        listeners.emplace_back(events.workspace.moveToMonitor.listen([this](PHLWORKSPACE, PHLMONITOR) { abort(); }));
+        listeners.emplace_back(events.monitor.preRemoved.listen([this](PHLMONITOR) { abort(); }));
+        listeners.emplace_back(events.monitor.layoutChanged.listen([this]() { abort(); }));
         listeners.emplace_back(events.monitor.focused.listen([this](PHLMONITOR m) {
-            if (active && m != monitor.lock()) abort(false);
+            if (active && m != monitor.lock()) abort();
         }));
-        listeners.emplace_back(events.config.preReload.listen([this]() { abort(false); }));
-        listeners.emplace_back(events.window.open.listen([this](PHLWINDOW) { if (!applying) abort(false); }));
-        listeners.emplace_back(events.window.close.listen([this](PHLWINDOW) { if (!applying) abort(false); }));
-        listeners.emplace_back(events.window.moveToWorkspace.listen([this](PHLWINDOW, PHLWORKSPACE) { if (!applying) abort(false); }));
-        listeners.emplace_back(events.window.floating.listen([this](PHLWINDOW) { if (!applying) abort(false); }));
-        listeners.emplace_back(events.window.fullscreen.listen([this](PHLWINDOW) { if (!applying) abort(false); }));
-        listeners.emplace_back(events.window.active.listen([this](PHLWINDOW, Desktop::eFocusReason) { if (!applying) abort(false); }));
+        listeners.emplace_back(events.config.preReload.listen([this]() { abort(); }));
+        listeners.emplace_back(events.window.open.listen([this](PHLWINDOW) { if (!applying) abort(); }));
+        listeners.emplace_back(events.window.close.listen([this](PHLWINDOW) { if (!applying) abort(); }));
+        listeners.emplace_back(events.window.moveToWorkspace.listen([this](PHLWINDOW, PHLWORKSPACE) { if (!applying) abort(); }));
+        listeners.emplace_back(events.window.floating.listen([this](PHLWINDOW) { if (!applying) abort(); }));
+        listeners.emplace_back(events.window.fullscreen.listen([this](PHLWINDOW) { if (!applying) abort(); }));
+        listeners.emplace_back(events.window.active.listen([this](PHLWINDOW, Desktop::eFocusReason) { if (!applying) abort(); }));
         listeners.emplace_back(events.input.keyboard.key.listen([this](IKeyboard::SKeyEvent, Event::SCallbackInfo&) { stopForInput(); }));
         listeners.emplace_back(events.input.mouse.button.listen([this](IPointer::SButtonEvent, Event::SCallbackInfo&) { stopForInput(); }));
         if (g_pSessionLockManager)
-            listeners.emplace_back(g_pSessionLockManager->m_events.lock.listen([this]() { abort(false); }));
+            listeners.emplace_back(g_pSessionLockManager->m_events.lock.listen([this]() { abort(); }));
     }
 
-    ~Runtime() { abort(false); }
+    ~Runtime() { abort(); }
 
     bool valid() const {
         const auto m = monitor.lock();
@@ -197,13 +197,10 @@ class Runtime {
             return false;
         if (active && monitor.lock() == m && valid()) {
             motion.grab(); // catch momentum at its exact visible position
-            initial = expected;
-            for (auto& state : workspaces)
-                if (const auto data = state.data.lock()) state.savedOffset = data->controller->getOffset();
         } else {
-            abort(false);
+            abort();
             monitor = m;
-            initial = expected = m->m_activeWorkspace;
+            expected = m->m_activeWorkspace;
             motion = {};
             motion.path.gap = std::max(1.0, m->m_size.x);
             std::vector<PHLWORKSPACE> ordered;
@@ -221,7 +218,7 @@ class Runtime {
                 const auto index = workspaces.size();
                 workspaces.push_back(state);
                 motion.path.pages.push_back(page);
-                if (ws == initial.lock()) {
+                if (ws == m->m_activeWorkspace) {
                     double offset = state.savedOffset;
                     if (const auto data = state.data.lock(); data && data->controller->isReversed()) offset = -offset;
                     motion.position = motion.path.start(index) + std::clamp(offset, page.low, page.high) - page.low;
@@ -248,7 +245,7 @@ class Runtime {
         if (!active || motion.phase != flow::Phase::Dragging)
             return;
         if (!valid()) {
-            abort(false);
+            abort();
             return;
         }
         if (!std::isfinite(dx) || std::abs(dx) > 10000)
@@ -266,17 +263,18 @@ class Runtime {
     void release(uint32_t time, bool cancelled) {
         if (!active)
             return;
-        if (cancelled) {
-            abort(true);
-            return;
-        }
         if (!valid()) {
-            abort(false);
+            abort();
             return;
         }
         const double eventAge = (time - timestamp) / 1000.0;
         const double wallAge = std::chrono::duration<double>(Clock::now() - lastInput).count();
-        motion.release(std::max(eventAge, wallAge), motion.path.gap);
+        // libinput cancellation ends contact; it is not an undo of every
+        // window/workspace already traversed. Drop momentum and settle at
+        // the current boundary instead of restoring the initial tape.
+        if (cancelled)
+            motion.velocity = 0;
+        motion.release(cancelled ? 1.0 : std::max(eventAge, wallAge), motion.path.gap);
         lastFrame = Clock::now();
         damage();
     }
@@ -371,7 +369,6 @@ class Runtime {
         damage();
         monitor.reset();
         expected.reset();
-        initial.reset();
     }
 
     void finish() {
@@ -405,29 +402,9 @@ class Runtime {
         finish();
     }
 
-    void abort(bool restore) {
-        if (!active)
-            return;
-        applying = true;
-        if (restore) {
-            const auto m = monitor.lock();
-            const auto ws = initial.lock();
-            if (m && ::valid(ws)) {
-                expected = ws;
-                m->changeWorkspace(ws, false, true, false);
-            }
-            for (auto& state : workspaces) {
-                if (state.touched) {
-                    if (const auto data = state.data.lock()) {
-                        data->controller->getScrollInhibitor().isInhibited = false;
-                        data->controller->setOffset(state.savedOffset);
-                        data->recalculate(true);
-                    }
-                }
-            }
-        }
-        applying = false;
-        cleanup();
+    void abort() {
+        if (active)
+            cleanup();
     }
 };
 
@@ -467,7 +444,7 @@ int end(lua_State* L) {
     return 0;
 }
 int cancel(lua_State*) {
-    if (runtime) runtime->abort(false);
+    if (runtime) runtime->abort();
     return 0;
 }
 int status(lua_State* L) {
@@ -543,7 +520,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
         runtime.reset();
         throw std::runtime_error("hyprspaceflow: Lua registration failed");
     }
-    return {"hyprspaceflow", "Continuous scrolling-to-workspace swipes with inertia", "predmore", "0.1.0"};
+    return {"hyprspaceflow", "Continuous scrolling-to-workspace swipes with inertia", "predmore", "0.1.1"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

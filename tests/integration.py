@@ -31,13 +31,23 @@ def case(name, code):
     lua(code)
     print('PASS', name, flush=True)
 
+def wait_idle():
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if ctl('repl', 'return hl.plugin.hyprspaceflow.status().phase') == 'idle':
+            return
+        time.sleep(.03)
+    raise AssertionError('release did not settle')
+
 lua('''
 function flow_test_clean(nativeSwitch)
   local s = hl.plugin.hyprspaceflow.status()
   assert(not s.active, "motion did not finish")
   assert(not s.scanout_blocked, "direct scanout override leaked")
   for _, p in ipairs(s.pages) do
-    if not nativeSwitch then
+    if nativeSwitch then
+      flow_test_baseline[p.id] = p.render_x
+    else
       assert(math.abs(p.render_x) < 0.1 or math.abs(p.render_x-flow_test_baseline[p.id]) < .1, "workspace transform leaked")
     end
     assert(not p.forced, "forced rendering leaked")
@@ -79,20 +89,18 @@ p.update({time_ms=1040,delta={x=-(last.start - p.status().position)}})
 assert(hl.get_active_workspace().id == 4, "could not cross three boundaries in one gesture")
 p.update({time_ms=1050,delta={x=p.status().position}})
 assert(hl.get_active_workspace().id == 1, "reversal lost remaining distance")
-p.finish({time_ms=1050,cancelled=true})
+p.cancel()
 flow_test_clean()
 ''')
 
-case('cancellation restores initial workspace and tape', '''
+case('explicit cancellation releases rendering ownership', '''
 local p = hl.plugin.hyprspaceflow
-local original = flow_test_page(1).tape
 assert(p.start({time_ms=2000}))
 local last = flow_test_page(4)
 p.update({time_ms=2010,delta={x=-(last.start-p.status().position)}})
 assert(hl.get_active_workspace().id == 4)
-p.finish({time_ms=2020,cancelled=true})
-assert(hl.get_active_workspace().id == 1)
-assert(math.abs(flow_test_page(1).tape-original) < .1)
+p.cancel()
+assert(hl.get_active_workspace().id == 4)
 flow_test_clean()
 ''')
 
@@ -114,7 +122,7 @@ local caught = p.status().position
 assert(p.start({time_ms=3200}))
 assert(math.abs(p.status().position-caught) < .01, "catch jumped")
 assert(p.status().velocity == 0)
-p.finish({time_ms=3200,cancelled=true})
+p.cancel()
 flow_test_clean()
 ''')
 
@@ -149,7 +157,7 @@ p.update({time_ms=2,delta={x=0/0}})
 assert(p.status().position == x)
 p.update({time_ms=2,delta={x=-10}})
 assert(p.status().position == x+10)
-p.finish({time_ms=2,cancelled=true})
+p.cancel()
 flow_test_clean()
 ''')
 
@@ -164,7 +172,7 @@ p.update({time_ms=7010,delta={x=s.position}})
 local low=flow_test_page(1).tape
 p.update({time_ms=7020,delta={x=-80}})
 assert(math.abs(flow_test_page(1).tape-low+80)<.1, "reversed physical direction is incorrect")
-p.finish({time_ms=7020,cancelled=true})
+p.cancel()
 hl.config({scrolling={direction="right"}})
 hl.dispatch(hl.dsp.layout("move +1"))
 flow_test_clean()
@@ -178,9 +186,41 @@ assert(flow_test_page(2).high == flow_test_page(2).low)
 local target = flow_test_page(3).start
 p.update({time_ms=8010,delta={x=-(target-p.status().position)}})
 assert(hl.get_active_workspace().id == 3, "mixed layout blocked continuous traversal")
-p.finish({time_ms=8010,cancelled=true})
+p.cancel()
 hl.workspace_rule({workspace="2",layout="scrolling"})
 flow_test_clean()
+''')
+
+# A physical cancelled end used to restore the first window after the user
+# had already traversed the whole tape. Exercise both native end variants,
+# both sides of the midpoint, and a reversal from the incoming workspace.
+fixture_windows = [w for w in json.loads(ctl('-j', 'clients'))
+                   if w['workspace']['id'] == 1 and not w['floating']]
+first = min(fixture_windows, key=lambda w: w['at'][0])['address']
+for cancelled in (False, True):
+    for fraction in (.49, .51):
+        for reverse_direction in (False, True):
+            label = f'edge release cancelled={cancelled} progress={fraction} reverse={reverse_direction}'
+            case(label + ' begins', f'''
+local p=hl.plugin.hyprspaceflow
+p.cancel()
+hl.config({{input={{follow_mouse=1}},scrolling={{focus_fit_method=1}},plugin={{hyprspaceflow={{sensitivity=1.0,acceleration=0.0,inertia=0.55,snap_columns=true}}}}}})
+hl.dispatch(hl.dsp.focus({{window="address:{first}"}}))
+if {str(reverse_direction).lower()} then hl.dispatch(hl.dsp.focus({{workspace="2"}})) end
+assert(p.start({{time_ms=10000}}))
+local page=flow_test_page(1)
+flow_test_edge=page.high
+local goal=page.start+page.high-page.low+p.status().viewport*{fraction}
+p.update({{time_ms=10010,delta={{x=-(goal-p.status().position)}}}})
+p.finish({{time_ms=10200,cancelled={str(cancelled).lower()}}})
+''')
+            wait_idle()
+            expected_workspace = 1 if fraction < .5 else 2
+            case(label + ' preserves boundary', f'''
+flow_test_clean(true)
+assert(math.abs(flow_test_page(1).render_x)<.1 and math.abs(flow_test_page(2).render_x)<.1, "boundary transforms leaked")
+assert(hl.get_active_workspace().id == {expected_workspace}, "settled to wrong workspace")
+assert(math.abs(flow_test_page(1).tape-flow_test_edge)<.1, "returned to start of outgoing workspace")
 ''')
 
 print('All compositor integration checks passed.')
