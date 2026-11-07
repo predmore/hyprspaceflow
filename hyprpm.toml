@@ -1,6 +1,9 @@
 [repository]
 name = "hyprspaceflow"
 authors = ["predmore"]
+commit_pins = [
+  ["efb50993780079460b0cbed1363e2166a2de1d9f", "9e4a62ca41f980b50f2bc889bf98a7ae58318c3b"],
+]
 
 [hyprspaceflow]
 description = "Continuous scrolling-to-workspace swipes with acceleration and inertia"
