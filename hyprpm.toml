@@ -2,7 +2,7 @@
 name = "hyprspaceflow"
 authors = ["predmore"]
 commit_pins = [
-  ["efb50993780079460b0cbed1363e2166a2de1d9f", "ff1b34845ce2ba1e8f0fe574defcef250e3b31eb"],
+  ["efb50993780079460b0cbed1363e2166a2de1d9f", "2b84e75f54992130e83493a77187d489a93f1f5d"],
 ]
 
 [hyprspaceflow]
